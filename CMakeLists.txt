@@ -104,6 +104,14 @@ add_library(enet
     ${SOURCE_FILES}
 )
 
+option(ENET_BUILD_BENCHMARKS "Build ENet scheduler benchmarks" OFF)
+if(ENET_BUILD_BENCHMARKS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(enet_scheduler_benchmark tests/scheduler_benchmark.c)
+    target_link_libraries(enet_scheduler_benchmark enet)
+    set_target_properties(enet_scheduler_benchmark PROPERTIES
+        LINK_FLAGS "-Wl,--wrap=sendmsg")
+endif()
+
 if (WIN32)
     target_link_libraries(enet winmm ws2_32)
 endif()

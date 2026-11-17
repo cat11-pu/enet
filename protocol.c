@@ -268,6 +268,8 @@ enet_protocol_remove_sent_reliable_command (ENetPeer * peer, enet_uint16 reliabl
     {
        if (wasSent)
          peer -> reliableDataInTransit -= outgoingCommand -> fragmentLength;
+       else
+         enet_peer_scheduler_account_dequeue (peer, outgoingCommand);
 
        -- outgoingCommand -> packet -> referenceCount;
 
@@ -1392,6 +1394,8 @@ enet_protocol_check_timeouts (ENetHost * host, ENetPeer * peer, ENetEvent * even
          peer -> reliableDataInTransit -= outgoingCommand -> fragmentLength;
 
          enet_list_insert (insertSendReliablePosition, enet_list_remove (& outgoingCommand -> outgoingCommandList));
+
+         enet_peer_scheduler_account_enqueue (peer, outgoingCommand);
        }
        else
          enet_list_insert (insertPosition, enet_list_remove (& outgoingCommand -> outgoingCommandList));
@@ -1409,41 +1413,67 @@ enet_protocol_check_timeouts (ENetHost * host, ENetPeer * peer, ENetEvent * even
 }
 
 static int
+enet_peer_scheduler_choose_reliable (ENetPeer * peer)
+{
+    if (peer -> schedulerUnreliableBudget > 0)
+    {
+       -- peer -> schedulerUnreliableBudget;
+       return 0;
+    }
+
+    if (peer -> schedulerReliableBudget > 0)
+    {
+       -- peer -> schedulerReliableBudget;
+       return 1;
+    }
+
+    peer -> schedulerUnreliableBudget = peer -> sendScheduler.unreliableWeight;
+    peer -> schedulerReliableBudget = peer -> sendScheduler.reliableWeight;
+
+    if (peer -> schedulerUnreliableBudget > 0)
+    {
+       -- peer -> schedulerUnreliableBudget;
+       return 0;
+    }
+
+    if (peer -> schedulerReliableBudget > 0)
+    {
+       -- peer -> schedulerReliableBudget;
+       return 1;
+    }
+
+    return 0;
+}
+
+static int
 enet_protocol_check_outgoing_commands (ENetHost * host, ENetPeer * peer, ENetList * sentUnreliableCommands)
 {
     ENetProtocol * command = & host -> commands [host -> commandCount];
     ENetBuffer * buffer = & host -> buffers [host -> bufferCount];
     ENetOutgoingCommand * outgoingCommand;
-    ENetListIterator currentCommand, currentSendReliableCommand;
     ENetChannel *channel = NULL;
     enet_uint16 reliableWindow = 0;
     size_t commandSize;
-    int windowWrap = 0, canPing = 1;
-
-    currentCommand = enet_list_begin (& peer -> outgoingCommands);
-    currentSendReliableCommand = enet_list_begin (& peer -> outgoingSendReliableCommands);
+    int windowWrap = 0, canPing = 1, reliableBlocked = 0;
 
     for (;;)
     {
-       if (currentCommand != enet_list_end (& peer -> outgoingCommands))
-       {
-          outgoingCommand = (ENetOutgoingCommand *) currentCommand;
+       int reliableAvailable = ! reliableBlocked && ! enet_list_empty (& peer -> outgoingSendReliableCommands),
+           unreliableAvailable = ! enet_list_empty (& peer -> outgoingCommands),
+           useReliable;
 
-          if (currentSendReliableCommand != enet_list_end (& peer -> outgoingSendReliableCommands) &&
-              ENET_TIME_LESS (((ENetOutgoingCommand *) currentSendReliableCommand) -> queueTime, outgoingCommand -> queueTime))
-            goto useSendReliableCommand;
-
-          currentCommand = enet_list_next (currentCommand);
-       }
-       else
-       if (currentSendReliableCommand != enet_list_end (& peer -> outgoingSendReliableCommands))
-       {
-       useSendReliableCommand:
-          outgoingCommand = (ENetOutgoingCommand *) currentSendReliableCommand;
-          currentSendReliableCommand = enet_list_next (currentSendReliableCommand);
-       }
-       else
+       if (! reliableAvailable && ! unreliableAvailable)
          break;
+
+       if (reliableAvailable && unreliableAvailable)
+         useReliable = enet_peer_scheduler_choose_reliable (peer);
+       else
+         useReliable = reliableAvailable;
+
+       if (useReliable)
+         outgoingCommand = (ENetOutgoingCommand *) enet_list_front (& peer -> outgoingSendReliableCommands);
+       else
+         outgoingCommand = (ENetOutgoingCommand *) enet_list_front (& peer -> outgoingCommands);
 
        if (outgoingCommand -> command.header.command & ENET_PROTOCOL_COMMAND_FLAG_ACKNOWLEDGE)
        {
@@ -1452,7 +1482,10 @@ enet_protocol_check_outgoing_commands (ENetHost * host, ENetPeer * peer, ENetLis
           if (channel != NULL)
           {
              if (windowWrap)
-               continue;
+             {
+                reliableBlocked = 1;
+                continue;
+             }
              else
              if (outgoingCommand -> sendAttempts < 1 &&
                   ! (outgoingCommand -> reliableSequenceNumber % ENET_PEER_RELIABLE_WINDOW_SIZE) &&
@@ -1461,7 +1494,7 @@ enet_protocol_check_outgoing_commands (ENetHost * host, ENetPeer * peer, ENetLis
                       (((1u << (ENET_PEER_FREE_RELIABLE_WINDOWS + 2)) - 1) >> (ENET_PEER_RELIABLE_WINDOWS - reliableWindow)))))
              {
                 windowWrap = 1;
-                currentSendReliableCommand = enet_list_end (& peer -> outgoingSendReliableCommands);
+                reliableBlocked = 1;
 
                 continue;
              }
@@ -1473,7 +1506,7 @@ enet_protocol_check_outgoing_commands (ENetHost * host, ENetPeer * peer, ENetLis
 
              if (peer -> reliableDataInTransit + outgoingCommand -> fragmentLength > ENET_MAX (windowSize, peer -> mtu))
              {
-                currentSendReliableCommand = enet_list_end (& peer -> outgoingSendReliableCommands);
+                reliableBlocked = 1;
 
                 continue;
              }
@@ -1510,6 +1543,7 @@ enet_protocol_check_outgoing_commands (ENetHost * host, ENetPeer * peer, ENetLis
           if (enet_list_empty (& peer -> sentReliableCommands))
             peer -> nextTimeout = host -> serviceTime + outgoingCommand -> roundTripTimeout;
 
+          enet_peer_scheduler_account_dequeue (peer, outgoingCommand);
           enet_list_insert (enet_list_end (& peer -> sentReliableCommands),
                             enet_list_remove (& outgoingCommand -> outgoingCommandList));
 
@@ -1521,40 +1555,45 @@ enet_protocol_check_outgoing_commands (ENetHost * host, ENetPeer * peer, ENetLis
        }
        else
        {
-          if (outgoingCommand -> packet != NULL && outgoingCommand -> fragmentOffset == 0)
+          if (outgoingCommand -> packet != NULL &&
+              outgoingCommand -> fragmentOffset == 0 &&
+              outgoingCommand -> sendPriority != ENET_SEND_PRIORITY_HIGH)
           {
              peer -> packetThrottleCounter += ENET_PEER_PACKET_THROTTLE_COUNTER;
              peer -> packetThrottleCounter %= ENET_PEER_PACKET_THROTTLE_SCALE;
 
              if (peer -> packetThrottleCounter > peer -> packetThrottle)
              {
+                ENetPacket * droppedPacket = outgoingCommand -> packet;
                 enet_uint16 reliableSequenceNumber = outgoingCommand -> reliableSequenceNumber,
                             unreliableSequenceNumber = outgoingCommand -> unreliableSequenceNumber;
-                for (;;)
+
+                while (! enet_list_empty (& peer -> outgoingCommands))
                 {
-                   -- outgoingCommand -> packet -> referenceCount;
+                   outgoingCommand = (ENetOutgoingCommand *) enet_list_front (& peer -> outgoingCommands);
 
-                   if (outgoingCommand -> packet -> referenceCount == 0)
-                     enet_packet_destroy (outgoingCommand -> packet);
-
-                   enet_list_remove (& outgoingCommand -> outgoingCommandList);
-                   enet_free (outgoingCommand);
-
-                   if (currentCommand == enet_list_end (& peer -> outgoingCommands))
-                     break;
-
-                   outgoingCommand = (ENetOutgoingCommand *) currentCommand;
-                   if (outgoingCommand -> reliableSequenceNumber != reliableSequenceNumber ||
+                   if (outgoingCommand -> packet != droppedPacket ||
+                       outgoingCommand -> reliableSequenceNumber != reliableSequenceNumber ||
                        outgoingCommand -> unreliableSequenceNumber != unreliableSequenceNumber)
                      break;
 
-                   currentCommand = enet_list_next (currentCommand);
+                   enet_peer_scheduler_account_dequeue (peer, outgoingCommand);
+                   enet_list_remove (& outgoingCommand -> outgoingCommandList);
+
+                   -- outgoingCommand -> packet -> referenceCount;
+                   enet_free (outgoingCommand);
                 }
+
+                if (droppedPacket -> referenceCount == 0)
+                  enet_packet_destroy (droppedPacket);
+
+                ++ peer -> schedulerUnreliableThrottleDrops;
 
                 continue;
              }
           }
 
+          enet_peer_scheduler_account_dequeue (peer, outgoingCommand);
           enet_list_remove (& outgoingCommand -> outgoingCommandList);
 
           if (outgoingCommand -> packet != NULL)
@@ -1918,4 +1957,3 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
 
     return 0; 
 }
-

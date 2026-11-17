@@ -115,6 +115,73 @@ typedef enum _ENetPacketFlag
    ENET_PACKET_FLAG_SENT = (1<<8)
 } ENetPacketFlag;
 
+/**
+ * Outgoing scheduler priority. The priority is used when the unreliable
+ * queue is full; lower priority packets are evicted before higher priority
+ * packets. ENET_SEND_PRIORITY_HIGH also bypasses ENet's adaptive unreliable
+ * throttle, so position-like state updates are only lost to actual network
+ * loss. Reliable packets are never evicted.
+ */
+typedef enum _ENetSendPriority
+{
+   ENET_SEND_PRIORITY_LOW    = 0,
+   ENET_SEND_PRIORITY_NORMAL = 1,
+   ENET_SEND_PRIORITY_HIGH   = 2
+} ENetSendPriority;
+
+/** Result of an enqueue attempt by enet_peer_send_ex(). */
+typedef enum _ENetSendResult
+{
+   ENET_SEND_RESULT_ERROR        = -1,
+   ENET_SEND_RESULT_OK           = 0,
+   ENET_SEND_RESULT_BACKPRESSURE = 1,
+   ENET_SEND_RESULT_DROPPED      = 2
+} ENetSendResult;
+
+typedef enum _ENetSendClass
+{
+   ENET_SEND_CLASS_CONTROL    = 0,
+   ENET_SEND_CLASS_RELIABLE   = 1,
+   ENET_SEND_CLASS_UNRELIABLE = 2
+} ENetSendClass;
+
+/**
+ * Per-peer outgoing scheduler configuration.
+ *
+ * reliableWeight and unreliableWeight control the command budget in each
+ * scheduling cycle. A zero value selects the default for that field.
+ * Reliable limits cause non-blocking backpressure. Unreliable limits cause
+ * priority-based eviction or dropping of the incoming packet.
+ */
+typedef struct _ENetSendSchedulerConfig
+{
+   enet_uint32 reliableWeight;
+   enet_uint32 unreliableWeight;
+   size_t      maxReliableBytes;
+   size_t      maxUnreliableBytes;
+   enet_uint32 maxReliableCommands;
+   enet_uint32 maxUnreliableCommands;
+} ENetSendSchedulerConfig;
+
+/** Per-peer outgoing scheduler counters. */
+typedef struct _ENetSendSchedulerStats
+{
+   size_t      reliableQueuedBytes;
+   size_t      unreliableQueuedBytes;
+   size_t      reliableInTransitBytes;
+   size_t      peakReliableQueuedBytes;
+   size_t      peakUnreliableQueuedBytes;
+   enet_uint32 reliableQueuedCommands;
+   enet_uint32 unreliableQueuedCommands;
+   enet_uint32 peakUnreliableQueuedCommands;
+   enet_uint32 reliableAdmitted;
+   enet_uint32 unreliableAdmitted;
+   enet_uint32 reliableBackpressure;
+   enet_uint32 unreliableDropped;
+   enet_uint32 unreliableDroppedBytes;
+   enet_uint32 unreliableThrottleDrops;
+} ENetSendSchedulerStats;
+
 typedef void (ENET_CALLBACK * ENetPacketFreeCallback) (struct _ENetPacket *);
 
 /**
@@ -162,6 +229,8 @@ typedef struct _ENetOutgoingCommand
    ENetListNode outgoingCommandList;
    enet_uint16  reliableSequenceNumber;
    enet_uint16  unreliableSequenceNumber;
+   enet_uint8   sendClass;
+   enet_uint8   sendPriority;
    enet_uint32  sentTime;
    enet_uint32  roundTripTimeout;
    enet_uint32  queueTime;
@@ -230,7 +299,14 @@ enum
    ENET_PEER_FREE_UNSEQUENCED_WINDOWS     = 32,
    ENET_PEER_RELIABLE_WINDOWS             = 16,
    ENET_PEER_RELIABLE_WINDOW_SIZE         = 0x1000,
-   ENET_PEER_FREE_RELIABLE_WINDOWS        = 8
+   ENET_PEER_FREE_RELIABLE_WINDOWS        = 8,
+
+   ENET_PEER_DEFAULT_SCHEDULER_RELIABLE_WEIGHT     = 1,
+   ENET_PEER_DEFAULT_SCHEDULER_UNRELIABLE_WEIGHT   = 4,
+   ENET_PEER_DEFAULT_SCHEDULER_MAX_RELIABLE_BYTES  = 256 * 1024,
+   ENET_PEER_DEFAULT_SCHEDULER_MAX_UNRELIABLE_BYTES = 32 * 1024,
+   ENET_PEER_DEFAULT_SCHEDULER_MAX_RELIABLE_COMMANDS = 1024,
+   ENET_PEER_DEFAULT_SCHEDULER_MAX_UNRELIABLE_COMMANDS = 256
 };
 
 typedef struct _ENetChannel
@@ -311,6 +387,22 @@ typedef struct _ENetPeer
    ENetList      outgoingSendReliableCommands;
    ENetList      outgoingCommands;
    ENetList      dispatchedCommands;
+   ENetSendSchedulerConfig sendScheduler;
+   size_t        schedulerReliableQueuedBytes;
+   size_t        schedulerUnreliableQueuedBytes;
+   size_t        schedulerPeakReliableQueuedBytes;
+   size_t        schedulerPeakUnreliableQueuedBytes;
+   enet_uint32   schedulerReliableQueuedCommands;
+   enet_uint32   schedulerUnreliableQueuedCommands;
+   enet_uint32   schedulerPeakUnreliableQueuedCommands;
+   enet_uint32   schedulerReliableAdmitted;
+   enet_uint32   schedulerUnreliableAdmitted;
+   enet_uint32   schedulerReliableBackpressure;
+   enet_uint32   schedulerUnreliableDropped;
+   enet_uint32   schedulerUnreliableDroppedBytes;
+   enet_uint32   schedulerUnreliableThrottleDrops;
+   enet_uint32   schedulerUnreliableBudget;
+   enet_uint32   schedulerReliableBudget;
    enet_uint16   flags;
    enet_uint16   reserved;
    enet_uint16   incomingUnsequencedGroup;
@@ -579,6 +671,9 @@ extern  enet_uint32 enet_host_random_seed (void);
 extern  enet_uint32 enet_host_random (ENetHost *);
 
 ENET_API int                 enet_peer_send (ENetPeer *, enet_uint8, ENetPacket *);
+ENET_API int                 enet_peer_send_ex (ENetPeer *, enet_uint8, ENetPacket *, ENetSendPriority);
+ENET_API void                enet_peer_send_scheduler_configure (ENetPeer *, const ENetSendSchedulerConfig *);
+ENET_API void                enet_peer_send_scheduler_get_stats (const ENetPeer *, ENetSendSchedulerStats *);
 ENET_API ENetPacket *        enet_peer_receive (ENetPeer *, enet_uint8 * channelID);
 ENET_API void                enet_peer_ping (ENetPeer *);
 ENET_API void                enet_peer_ping_interval (ENetPeer *, enet_uint32);
@@ -591,6 +686,8 @@ ENET_API void                enet_peer_throttle_configure (ENetPeer *, enet_uint
 extern int                   enet_peer_throttle (ENetPeer *, enet_uint32);
 extern void                  enet_peer_reset_queues (ENetPeer *);
 extern int                   enet_peer_has_outgoing_commands (ENetPeer *);
+extern void                  enet_peer_scheduler_account_enqueue (ENetPeer *, ENetOutgoingCommand *);
+extern void                  enet_peer_scheduler_account_dequeue (ENetPeer *, ENetOutgoingCommand *);
 extern void                  enet_peer_setup_outgoing_command (ENetPeer *, ENetOutgoingCommand *);
 extern ENetOutgoingCommand * enet_peer_queue_outgoing_command (ENetPeer *, const ENetProtocol *, ENetPacket *, enet_uint32, enet_uint16);
 extern ENetIncomingCommand * enet_peer_queue_incoming_command (ENetPeer *, const ENetProtocol *, const void *, size_t, enet_uint32, enet_uint32);
@@ -612,4 +709,3 @@ extern size_t enet_protocol_command_size (enet_uint8);
 #endif
 
 #endif /* __ENET_ENET_H__ */
-

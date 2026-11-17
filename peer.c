@@ -7,6 +7,222 @@
 #include "enet/utility.h"
 #include "enet/enet.h"
 
+static void
+enet_peer_send_scheduler_apply_defaults (ENetSendSchedulerConfig * config)
+{
+    if (config -> reliableWeight == 0)
+      config -> reliableWeight = ENET_PEER_DEFAULT_SCHEDULER_RELIABLE_WEIGHT;
+    if (config -> unreliableWeight == 0)
+      config -> unreliableWeight = ENET_PEER_DEFAULT_SCHEDULER_UNRELIABLE_WEIGHT;
+    if (config -> maxReliableBytes == 0)
+      config -> maxReliableBytes = ENET_PEER_DEFAULT_SCHEDULER_MAX_RELIABLE_BYTES;
+    if (config -> maxUnreliableBytes == 0)
+      config -> maxUnreliableBytes = ENET_PEER_DEFAULT_SCHEDULER_MAX_UNRELIABLE_BYTES;
+    if (config -> maxReliableCommands == 0)
+      config -> maxReliableCommands = ENET_PEER_DEFAULT_SCHEDULER_MAX_RELIABLE_COMMANDS;
+    if (config -> maxUnreliableCommands == 0)
+      config -> maxUnreliableCommands = ENET_PEER_DEFAULT_SCHEDULER_MAX_UNRELIABLE_COMMANDS;
+}
+
+static int
+enet_peer_scheduler_limit_exceeded (size_t used, size_t incoming, size_t limit)
+{
+    return incoming > limit || used > limit - incoming;
+}
+
+void
+enet_peer_scheduler_account_enqueue (ENetPeer * peer, ENetOutgoingCommand * outgoingCommand)
+{
+    if (outgoingCommand -> packet == NULL)
+      return;
+
+    if (outgoingCommand -> sendClass == ENET_SEND_CLASS_RELIABLE)
+    {
+       peer -> schedulerReliableQueuedBytes += outgoingCommand -> fragmentLength;
+       ++ peer -> schedulerReliableQueuedCommands;
+
+       if (peer -> schedulerReliableQueuedBytes > peer -> schedulerPeakReliableQueuedBytes)
+         peer -> schedulerPeakReliableQueuedBytes = peer -> schedulerReliableQueuedBytes;
+    }
+    else
+    if (outgoingCommand -> sendClass == ENET_SEND_CLASS_UNRELIABLE)
+    {
+       peer -> schedulerUnreliableQueuedBytes += outgoingCommand -> fragmentLength;
+       ++ peer -> schedulerUnreliableQueuedCommands;
+
+       if (peer -> schedulerUnreliableQueuedBytes > peer -> schedulerPeakUnreliableQueuedBytes)
+         peer -> schedulerPeakUnreliableQueuedBytes = peer -> schedulerUnreliableQueuedBytes;
+       if (peer -> schedulerUnreliableQueuedCommands > peer -> schedulerPeakUnreliableQueuedCommands)
+         peer -> schedulerPeakUnreliableQueuedCommands = peer -> schedulerUnreliableQueuedCommands;
+    }
+}
+
+void
+enet_peer_scheduler_account_dequeue (ENetPeer * peer, ENetOutgoingCommand * outgoingCommand)
+{
+    if (outgoingCommand -> packet == NULL)
+      return;
+
+    if (outgoingCommand -> sendClass == ENET_SEND_CLASS_RELIABLE)
+    {
+       peer -> schedulerReliableQueuedBytes -= ENET_MIN (peer -> schedulerReliableQueuedBytes,
+                                                        (size_t) outgoingCommand -> fragmentLength);
+       if (peer -> schedulerReliableQueuedCommands > 0)
+         -- peer -> schedulerReliableQueuedCommands;
+    }
+    else
+    if (outgoingCommand -> sendClass == ENET_SEND_CLASS_UNRELIABLE)
+    {
+       peer -> schedulerUnreliableQueuedBytes -= ENET_MIN (peer -> schedulerUnreliableQueuedBytes,
+                                                          (size_t) outgoingCommand -> fragmentLength);
+       if (peer -> schedulerUnreliableQueuedCommands > 0)
+         -- peer -> schedulerUnreliableQueuedCommands;
+    }
+}
+
+static void
+enet_peer_scheduler_discard_unreliable_packet (ENetPeer * peer, ENetPacket * packet)
+{
+    ENetListIterator currentCommand;
+    size_t droppedBytes = 0;
+
+    for (currentCommand = enet_list_begin (& peer -> outgoingCommands);
+         currentCommand != enet_list_end (& peer -> outgoingCommands); )
+    {
+       ENetOutgoingCommand * outgoingCommand = (ENetOutgoingCommand *) currentCommand;
+
+       currentCommand = enet_list_next (currentCommand);
+
+       if (outgoingCommand -> packet != packet ||
+           outgoingCommand -> sendClass != ENET_SEND_CLASS_UNRELIABLE)
+         continue;
+
+       droppedBytes += outgoingCommand -> fragmentLength;
+
+       enet_peer_scheduler_account_dequeue (peer, outgoingCommand);
+       enet_list_remove (& outgoingCommand -> outgoingCommandList);
+
+       -- outgoingCommand -> packet -> referenceCount;
+       enet_free (outgoingCommand);
+    }
+
+    if (packet -> referenceCount == 0)
+      enet_packet_destroy (packet);
+
+    if (droppedBytes > 0)
+    {
+       ++ peer -> schedulerUnreliableDropped;
+       peer -> schedulerUnreliableDroppedBytes += (enet_uint32) droppedBytes;
+    }
+}
+
+static ENetPacket *
+enet_peer_scheduler_find_unreliable_victim (ENetPeer * peer, ENetSendPriority priority)
+{
+    ENetOutgoingCommand * victim = NULL;
+    ENetListIterator currentCommand;
+
+    for (currentCommand = enet_list_begin (& peer -> outgoingCommands);
+         currentCommand != enet_list_end (& peer -> outgoingCommands);
+         currentCommand = enet_list_next (currentCommand))
+    {
+       ENetOutgoingCommand * outgoingCommand = (ENetOutgoingCommand *) currentCommand;
+
+       if (outgoingCommand -> packet == NULL ||
+           outgoingCommand -> sendClass != ENET_SEND_CLASS_UNRELIABLE ||
+           outgoingCommand -> sendPriority > priority)
+         continue;
+
+       if (victim == NULL || outgoingCommand -> sendPriority < victim -> sendPriority)
+         victim = outgoingCommand;
+    }
+
+    return victim != NULL ? victim -> packet : NULL;
+}
+
+static int
+enet_peer_scheduler_reserve_unreliable (ENetPeer * peer, size_t bytes, enet_uint32 commands, ENetSendPriority priority)
+{
+    ENetSendSchedulerConfig * config = & peer -> sendScheduler;
+    int wasFull;
+
+    if (enet_peer_scheduler_limit_exceeded (0, bytes, config -> maxUnreliableBytes) ||
+        enet_peer_scheduler_limit_exceeded (0, commands, config -> maxUnreliableCommands))
+      return 0;
+
+    wasFull = enet_peer_scheduler_limit_exceeded (peer -> schedulerUnreliableQueuedBytes, bytes, config -> maxUnreliableBytes) ||
+              enet_peer_scheduler_limit_exceeded (peer -> schedulerUnreliableQueuedCommands, commands, config -> maxUnreliableCommands);
+
+    while (enet_peer_scheduler_limit_exceeded (peer -> schedulerUnreliableQueuedBytes, bytes, config -> maxUnreliableBytes) ||
+           enet_peer_scheduler_limit_exceeded (peer -> schedulerUnreliableQueuedCommands, commands, config -> maxUnreliableCommands))
+    {
+       ENetPacket * victim = enet_peer_scheduler_find_unreliable_victim (peer, priority);
+
+       if (victim == NULL)
+         return 0;
+
+       enet_peer_scheduler_discard_unreliable_packet (peer, victim);
+    }
+
+    if (wasFull && priority > ENET_SEND_PRIORITY_LOW)
+    {
+       size_t highWatermarkBytes = config -> maxUnreliableBytes / 8;
+       enet_uint32 highWatermarkCommands = config -> maxUnreliableCommands / 8;
+
+       while (peer -> schedulerUnreliableQueuedBytes > highWatermarkBytes ||
+              peer -> schedulerUnreliableQueuedCommands > highWatermarkCommands)
+       {
+          ENetPacket * victim = enet_peer_scheduler_find_unreliable_victim (peer, (ENetSendPriority) (priority - 1));
+
+          if (victim == NULL)
+            break;
+
+          enet_peer_scheduler_discard_unreliable_packet (peer, victim);
+       }
+    }
+
+    return 1;
+}
+
+void
+enet_peer_send_scheduler_configure (ENetPeer * peer, const ENetSendSchedulerConfig * config)
+{
+    if (peer == NULL || config == NULL)
+      return;
+
+    peer -> sendScheduler = * config;
+    enet_peer_send_scheduler_apply_defaults (& peer -> sendScheduler);
+    peer -> schedulerReliableBudget = 0;
+    peer -> schedulerUnreliableBudget = 0;
+}
+
+void
+enet_peer_send_scheduler_get_stats (const ENetPeer * peer, ENetSendSchedulerStats * stats)
+{
+    if (stats == NULL)
+      return;
+
+    memset (stats, 0, sizeof (* stats));
+
+    if (peer == NULL)
+      return;
+
+    stats -> reliableQueuedBytes = peer -> schedulerReliableQueuedBytes;
+    stats -> unreliableQueuedBytes = peer -> schedulerUnreliableQueuedBytes;
+    stats -> reliableInTransitBytes = peer -> reliableDataInTransit;
+    stats -> peakReliableQueuedBytes = peer -> schedulerPeakReliableQueuedBytes;
+    stats -> peakUnreliableQueuedBytes = peer -> schedulerPeakUnreliableQueuedBytes;
+    stats -> reliableQueuedCommands = peer -> schedulerReliableQueuedCommands;
+    stats -> unreliableQueuedCommands = peer -> schedulerUnreliableQueuedCommands;
+    stats -> peakUnreliableQueuedCommands = peer -> schedulerPeakUnreliableQueuedCommands;
+    stats -> reliableAdmitted = peer -> schedulerReliableAdmitted;
+    stats -> unreliableAdmitted = peer -> schedulerUnreliableAdmitted;
+    stats -> reliableBackpressure = peer -> schedulerReliableBackpressure;
+    stats -> unreliableDropped = peer -> schedulerUnreliableDropped;
+    stats -> unreliableDroppedBytes = peer -> schedulerUnreliableDroppedBytes;
+    stats -> unreliableThrottleDrops = peer -> schedulerUnreliableThrottleDrops;
+}
+
 /** @defgroup peer ENet peer functions 
     @{
 */
@@ -107,32 +323,98 @@ enet_peer_throttle (ENetPeer * peer, enet_uint32 rtt)
 int
 enet_peer_send (ENetPeer * peer, enet_uint8 channelID, ENetPacket * packet)
 {
+   return enet_peer_send_ex (peer, channelID, packet, ENET_SEND_PRIORITY_NORMAL) == ENET_SEND_RESULT_OK ? 0 : -1;
+}
+
+/** Queues a packet with an outgoing scheduler priority.
+
+    Reliable packets are never evicted. If their queue is full, this function
+    returns ENET_SEND_RESULT_BACKPRESSURE immediately and the caller retains
+    ownership of the packet. Unreliable packets may evict older packets of
+    lower or equal priority when the unreliable queue is full.
+
+    @param peer destination for the packet
+    @param channelID channel on which to send
+    @param packet packet to send
+    @param priority priority used for unreliable queue eviction
+    @retval ENET_SEND_RESULT_OK if ENet took ownership of the packet
+    @retval ENET_SEND_RESULT_BACKPRESSURE if a reliable queue is full
+    @retval ENET_SEND_RESULT_DROPPED if an unreliable packet was dropped
+    @retval ENET_SEND_RESULT_ERROR on invalid input or allocation failure
+*/
+int
+enet_peer_send_ex (ENetPeer * peer, enet_uint8 channelID, ENetPacket * packet, ENetSendPriority priority)
+{
    ENetChannel * channel;
    ENetProtocol command;
    size_t fragmentLength;
+   enet_uint32 fragmentCount;
+   int reliable;
 
-   if (peer -> state != ENET_PEER_STATE_CONNECTED ||
+   if (peer == NULL || packet == NULL ||
+       (int) priority < (int) ENET_SEND_PRIORITY_LOW ||
+       (int) priority > (int) ENET_SEND_PRIORITY_HIGH ||
+       peer -> state != ENET_PEER_STATE_CONNECTED ||
        channelID >= peer -> channelCount ||
        packet -> dataLength > peer -> host -> maximumPacketSize)
-     return -1;
+     return ENET_SEND_RESULT_ERROR;
 
    channel = & peer -> channels [channelID];
    fragmentLength = peer -> mtu - sizeof (ENetProtocolHeader) - sizeof (ENetProtocolSendFragment);
    if (peer -> host -> checksum != NULL)
      fragmentLength -= sizeof(enet_uint32);
 
+   fragmentCount = 1;
+   reliable = (packet -> flags & ENET_PACKET_FLAG_RELIABLE) != 0 ||
+              channel -> outgoingUnreliableSequenceNumber >= 0xFFFF;
+
    if (packet -> dataLength > fragmentLength)
    {
-      enet_uint32 fragmentCount = (packet -> dataLength + fragmentLength - 1) / fragmentLength,
-             fragmentNumber,
+      fragmentCount = (packet -> dataLength + fragmentLength - 1) / fragmentLength;
+
+      if (fragmentCount > ENET_PROTOCOL_MAXIMUM_FRAGMENT_COUNT)
+        return ENET_SEND_RESULT_ERROR;
+
+      reliable = ((packet -> flags & (ENET_PACKET_FLAG_RELIABLE | ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT)) != ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT) ||
+                 channel -> outgoingUnreliableSequenceNumber >= 0xFFFF;
+   }
+   else
+   if ((packet -> flags & (ENET_PACKET_FLAG_RELIABLE | ENET_PACKET_FLAG_UNSEQUENCED)) == ENET_PACKET_FLAG_UNSEQUENCED)
+     reliable = 0;
+
+   if (reliable)
+   {
+      ENetSendSchedulerConfig * config = & peer -> sendScheduler;
+
+      if (enet_peer_scheduler_limit_exceeded (0, packet -> dataLength, config -> maxReliableBytes) ||
+          enet_peer_scheduler_limit_exceeded (0, fragmentCount, config -> maxReliableCommands) ||
+          enet_peer_scheduler_limit_exceeded (peer -> schedulerReliableQueuedBytes + peer -> reliableDataInTransit,
+                                              packet -> dataLength,
+                                              config -> maxReliableBytes) ||
+          enet_peer_scheduler_limit_exceeded (peer -> schedulerReliableQueuedCommands,
+                                              fragmentCount,
+                                              config -> maxReliableCommands))
+      {
+         ++ peer -> schedulerReliableBackpressure;
+         return ENET_SEND_RESULT_BACKPRESSURE;
+      }
+   }
+   else
+   if (! enet_peer_scheduler_reserve_unreliable (peer, packet -> dataLength, fragmentCount, priority))
+   {
+     ++ peer -> schedulerUnreliableDropped;
+     peer -> schedulerUnreliableDroppedBytes += (enet_uint32) packet -> dataLength;
+     return ENET_SEND_RESULT_DROPPED;
+   }
+
+   if (packet -> dataLength > fragmentLength)
+   {
+      enet_uint32 fragmentNumber,
              fragmentOffset;
       enet_uint8 commandNumber;
       enet_uint16 startSequenceNumber; 
       ENetList fragments;
       ENetOutgoingCommand * fragment;
-
-      if (fragmentCount > ENET_PROTOCOL_MAXIMUM_FRAGMENT_COUNT)
-        return -1;
 
       if ((packet -> flags & (ENET_PACKET_FLAG_RELIABLE | ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT)) == ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT &&
           channel -> outgoingUnreliableSequenceNumber < 0xFFFF)
@@ -167,12 +449,13 @@ enet_peer_send (ENetPeer * peer, enet_uint8 channelID, ENetPacket * packet)
                enet_free (fragment);
             }
             
-            return -1;
+            return ENET_SEND_RESULT_ERROR;
          }
          
          fragment -> fragmentOffset = fragmentOffset;
          fragment -> fragmentLength = fragmentLength;
          fragment -> packet = packet;
+         fragment -> sendPriority = (enet_uint8) priority;
          fragment -> command.header.command = commandNumber;
          fragment -> command.header.channelID = channelID;
          fragment -> command.sendFragment.startSequenceNumber = startSequenceNumber;
@@ -194,7 +477,12 @@ enet_peer_send (ENetPeer * peer, enet_uint8 channelID, ENetPacket * packet)
          enet_peer_setup_outgoing_command (peer, fragment);
       }
 
-      return 0;
+      if (reliable)
+         ++ peer -> schedulerReliableAdmitted;
+      else
+         ++ peer -> schedulerUnreliableAdmitted;
+
+      return ENET_SEND_RESULT_OK;
    }
 
    command.header.channelID = channelID;
@@ -216,10 +504,20 @@ enet_peer_send (ENetPeer * peer, enet_uint8 channelID, ENetPacket * packet)
       command.sendUnreliable.dataLength = ENET_HOST_TO_NET_16 (packet -> dataLength);
    }
 
-   if (enet_peer_queue_outgoing_command (peer, & command, packet, 0, packet -> dataLength) == NULL)
-     return -1;
+   {
+      ENetOutgoingCommand * outgoingCommand = enet_peer_queue_outgoing_command (peer, & command, packet, 0, packet -> dataLength);
 
-   return 0;
+      if (outgoingCommand == NULL)
+        return ENET_SEND_RESULT_ERROR;
+
+      outgoingCommand -> sendPriority = (enet_uint8) priority;
+      if (reliable)
+        ++ peer -> schedulerReliableAdmitted;
+      else
+        ++ peer -> schedulerUnreliableAdmitted;
+   }
+
+   return ENET_SEND_RESULT_OK;
 }
 
 /** Attempts to dequeue any incoming queued packet.
@@ -335,6 +633,22 @@ enet_peer_reset_queues (ENetPeer * peer)
     enet_peer_reset_outgoing_commands (peer, & peer -> outgoingSendReliableCommands);
     enet_peer_reset_incoming_commands (peer, & peer -> dispatchedCommands);
 
+    peer -> schedulerReliableQueuedBytes = 0;
+    peer -> schedulerUnreliableQueuedBytes = 0;
+    peer -> schedulerPeakReliableQueuedBytes = 0;
+    peer -> schedulerPeakUnreliableQueuedBytes = 0;
+    peer -> schedulerReliableQueuedCommands = 0;
+    peer -> schedulerUnreliableQueuedCommands = 0;
+    peer -> schedulerPeakUnreliableQueuedCommands = 0;
+    peer -> schedulerReliableAdmitted = 0;
+    peer -> schedulerUnreliableAdmitted = 0;
+    peer -> schedulerReliableBackpressure = 0;
+    peer -> schedulerUnreliableDropped = 0;
+    peer -> schedulerUnreliableDroppedBytes = 0;
+    peer -> schedulerUnreliableThrottleDrops = 0;
+    peer -> schedulerReliableBudget = 0;
+    peer -> schedulerUnreliableBudget = 0;
+
     if (peer -> channels != NULL && peer -> channelCount > 0)
     {
         for (channel = peer -> channels;
@@ -432,6 +746,8 @@ enet_peer_reset (ENetPeer * peer)
     peer -> eventData = 0;
     peer -> totalWaitingData = 0;
     peer -> flags = 0;
+
+    enet_peer_send_scheduler_apply_defaults (& peer -> sendScheduler);
 
     memset (peer -> unsequencedWindow, 0, sizeof (peer -> unsequencedWindow));
     
@@ -681,8 +997,15 @@ enet_peer_setup_outgoing_command (ENetPeer * peer, ENetOutgoingCommand * outgoin
     outgoingCommand -> sendAttempts = 0;
     outgoingCommand -> sentTime = 0;
     outgoingCommand -> roundTripTimeout = 0;
+    if (outgoingCommand -> packet == NULL)
+      outgoingCommand -> sendClass = ENET_SEND_CLASS_CONTROL;
+    else
+    if ((outgoingCommand -> command.header.command & ENET_PROTOCOL_COMMAND_FLAG_ACKNOWLEDGE) != 0)
+      outgoingCommand -> sendClass = ENET_SEND_CLASS_RELIABLE;
+    else
+      outgoingCommand -> sendClass = ENET_SEND_CLASS_UNRELIABLE;
     outgoingCommand -> command.header.reliableSequenceNumber = ENET_HOST_TO_NET_16 (outgoingCommand -> reliableSequenceNumber);
-    outgoingCommand -> queueTime = ++ peer -> host -> totalQueued;
+   outgoingCommand -> queueTime = ++ peer -> host -> totalQueued;
 
     switch (outgoingCommand -> command.header.command & ENET_PROTOCOL_COMMAND_MASK)
     {
@@ -703,6 +1026,8 @@ enet_peer_setup_outgoing_command (ENetPeer * peer, ENetOutgoingCommand * outgoin
       enet_list_insert (enet_list_end (& peer -> outgoingSendReliableCommands), outgoingCommand);
     else
       enet_list_insert (enet_list_end (& peer -> outgoingCommands), outgoingCommand);
+
+    enet_peer_scheduler_account_enqueue (peer, outgoingCommand);
 }
 
 ENetOutgoingCommand *
@@ -716,6 +1041,7 @@ enet_peer_queue_outgoing_command (ENetPeer * peer, const ENetProtocol * command,
     outgoingCommand -> fragmentOffset = offset;
     outgoingCommand -> fragmentLength = length;
     outgoingCommand -> packet = packet;
+    outgoingCommand -> sendPriority = ENET_SEND_PRIORITY_NORMAL;
     if (packet != NULL)
       ++ packet -> referenceCount;
 

@@ -1,0 +1,92 @@
+/** @page scheduler Outgoing send scheduler
+
+ENet's outgoing queues can be configured per peer to protect time-critical
+state updates from reliable-event backlog.
+
+@section scheduler_model Scheduling model
+
+The scheduler uses the existing ENet outgoing command queues:
+
+- Reliable data is placed in the reliable queue and is never discarded.
+- Unreliable data is placed in the unreliable queue and is evicted by
+  priority when the queue reaches its byte or command limit.
+- Both queues are selected with a deterministic weighted command budget.
+  The default is 1 reliable command for every 4 unreliable commands.
+- A full reliable queue returns @ref ENET_SEND_RESULT_BACKPRESSURE
+  immediately. The caller keeps ownership of the packet and can retry later.
+  No network I/O or waiting is performed by enet_peer_send_ex().
+- A full unreliable queue evicts older packets with priority lower than or
+  equal to the incoming packet. If the incoming packet cannot displace
+  anything, it is dropped and @ref ENET_SEND_RESULT_DROPPED is returned.
+- ENET_SEND_PRIORITY_HIGH also bypasses ENet's adaptive unreliable throttle.
+  It can still be lost by the network, but not by local congestion throttling.
+
+@section scheduler_channels Channels
+
+Place reliable events and position updates on separate ENet channels. ENet
+associates unreliable commands with the last reliable sequence number on the
+same channel. If both classes share a channel, a missing reliable event can
+hold later unreliable commands at the receiver until the reliable retransmit
+arrives, regardless of sender-side scheduling.
+
+@section scheduler_api API
+
+Configure a peer after enet_host_connect() or after accepting a connection:
+
+@code
+ENetSendSchedulerConfig config = {
+   1, 4,
+   256 * 1024, 32 * 1024,
+   1024, 256
+};
+enet_peer_send_scheduler_configure(peer, &config);
+@endcode
+
+Queue a position update and a reliable event:
+
+@code
+int positionResult = enet_peer_send_ex(peer, POSITION_CHANNEL, positionPacket,
+                                       ENET_SEND_PRIORITY_HIGH);
+int eventResult = enet_peer_send_ex(peer, EVENT_CHANNEL, eventPacket,
+                                    ENET_SEND_PRIORITY_NORMAL);
+
+if (eventResult == ENET_SEND_RESULT_BACKPRESSURE) {
+   /* Keep eventPacket and retry after the host has been serviced. */
+}
+@endcode
+
+On any result other than ENET_SEND_RESULT_OK, the caller still owns the
+packet and must destroy it or retry it. On success, ENet owns the packet.
+
+Queue and eviction counters are available through
+enet_peer_send_scheduler_get_stats().
+
+@section scheduler_loss High packet loss
+
+ENet's default disconnect policy can be too aggressive for a 30% packet loss
+link because it disconnects after a short retry budget. For deployments that
+must deliver reliable events over such links, raise the retry budget:
+
+@code
+enet_peer_timeout(peer, 1024, 30000, 120000);
+@endcode
+
+The scheduler itself never drops reliable data. The transport must be allowed
+to retransmit long enough for the required delivery guarantee.
+
+@section scheduler_benchmark Benchmark
+
+Build and run the loopback benchmark:
+
+@code
+cmake -S . -B build -DENET_BUILD_BENCHMARKS=ON
+cmake --build build
+./build/enet_scheduler_benchmark 0
+./build/enet_scheduler_benchmark 30
+@endcode
+
+The benchmark creates 128 real ENet connections, fills each reliable queue
+beyond its configured limit, fills the unreliable queue with low-priority
+noise, sends high-priority position updates at 60 Hz, and drops 30% of UDP
+datagrams in both directions after connection setup.
+*/
