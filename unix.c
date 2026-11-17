@@ -2,6 +2,10 @@
  @file  unix.c
  @brief ENet Unix system specific functions
 */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #ifndef _WIN32
 
 #include <sys/types.h>
@@ -477,6 +481,86 @@ enet_socket_send (ENetSocket socket,
 }
 
 int
+enet_socket_send_batch (ENetSocket socket,
+                        ENetSendMessage * messages,
+                        size_t messageCount)
+{
+    size_t firstMessage = 0;
+
+    while (firstMessage < messageCount)
+    {
+        size_t currentMessage,
+               batchCount = messageCount - firstMessage;
+
+        if (batchCount > ENET_SOCKET_SEND_BATCH_MAXIMUM)
+          batchCount = ENET_SOCKET_SEND_BATCH_MAXIMUM;
+
+#ifdef HAS_SENDMMSG
+        {
+            struct mmsghdr mmsg [ENET_SOCKET_SEND_BATCH_MAXIMUM];
+            struct sockaddr_in sin [ENET_SOCKET_SEND_BATCH_MAXIMUM];
+            int batchSent;
+
+            memset (mmsg, 0, sizeof (struct mmsghdr) * batchCount);
+
+            for (currentMessage = 0; currentMessage < batchCount; ++ currentMessage)
+            {
+                ENetSendMessage * message = & messages [firstMessage + currentMessage];
+
+                memset (& sin [currentMessage], 0, sizeof (struct sockaddr_in));
+
+                sin [currentMessage].sin_family = AF_INET;
+                sin [currentMessage].sin_port = ENET_HOST_TO_NET_16 (message -> address.port);
+                sin [currentMessage].sin_addr.s_addr = message -> address.host;
+
+                mmsg [currentMessage].msg_hdr.msg_name = & sin [currentMessage];
+                mmsg [currentMessage].msg_hdr.msg_namelen = sizeof (struct sockaddr_in);
+                mmsg [currentMessage].msg_hdr.msg_iov = (struct iovec *) message -> buffers;
+                mmsg [currentMessage].msg_hdr.msg_iovlen = message -> bufferCount;
+            }
+
+            batchSent = sendmmsg (socket, mmsg, (unsigned int) batchCount, MSG_NOSIGNAL);
+
+            if (batchSent == -1)
+            {
+                if (errno == EWOULDBLOCK || errno == EAGAIN)
+                {
+                    for (currentMessage = 0; currentMessage < batchCount; ++ currentMessage)
+                      messages [firstMessage + currentMessage].sentLength = 0;
+
+                    firstMessage += batchCount;
+
+                    continue;
+                }
+
+                return -1;
+            }
+
+            for (currentMessage = 0; currentMessage < batchCount; ++ currentMessage)
+              messages [firstMessage + currentMessage].sentLength =
+                currentMessage < (size_t) batchSent ? (int) mmsg [currentMessage].msg_len : 0;
+        }
+#else
+        for (currentMessage = 0; currentMessage < batchCount; ++ currentMessage)
+        {
+            ENetSendMessage * message = & messages [firstMessage + currentMessage];
+
+            message -> sentLength = enet_socket_send (socket,
+                                                       & message -> address,
+                                                       message -> buffers,
+                                                       message -> bufferCount);
+            if (message -> sentLength < 0)
+              return -1;
+        }
+#endif
+
+        firstMessage += batchCount;
+    }
+
+    return (int) messageCount;
+}
+
+int
 enet_socket_receive (ENetSocket socket,
                      ENetAddress * address,
                      ENetBuffer * buffers,
@@ -627,4 +711,3 @@ enet_socket_wait (ENetSocket socket, enet_uint32 * condition, enet_uint32 timeou
 }
 
 #endif
-

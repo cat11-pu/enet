@@ -192,6 +192,79 @@ enet_protocol_remove_sent_unreliable_commands (ENetPeer * peer, ENetList * sentU
       enet_peer_disconnect (peer, peer -> eventData);
 }
 
+static int
+enet_protocol_flush_send_batch (ENetHost * host)
+{
+    size_t currentMessage;
+    int sentMessages;
+
+    if (host -> sendBatchCount == 0)
+      return 0;
+
+    sentMessages = enet_socket_send_batch (host -> socket,
+                                           host -> sendBatch,
+                                           host -> sendBatchCount);
+
+    if (sentMessages < 0)
+    {
+        host -> sendBatchCount = 0;
+
+        return -1;
+    }
+
+    for (currentMessage = 0; currentMessage < host -> sendBatchCount; ++ currentMessage)
+    {
+        if (host -> sendBatch [currentMessage].sentLength > 0)
+          host -> totalSentData += host -> sendBatch [currentMessage].sentLength;
+    }
+
+    host -> totalSentPackets += host -> sendBatchCount;
+    host -> sendBatchCount = 0;
+
+    return 0;
+}
+
+#if ENET_SOCKET_SUPPORTS_SEND_BATCH
+static int
+enet_protocol_queue_send_batch (ENetHost * host, ENetPeer * peer)
+{
+    ENetSendMessage * message;
+    enet_uint8 * data;
+    size_t currentBuffer,
+           dataLength = 0;
+
+    if (host -> sendBatchCount == ENET_SOCKET_SEND_BATCH_MAXIMUM &&
+        enet_protocol_flush_send_batch (host) < 0)
+      return -1;
+
+    message = & host -> sendBatch [host -> sendBatchCount];
+    data = host -> sendBatchData [host -> sendBatchCount];
+
+    for (currentBuffer = 0; currentBuffer < host -> bufferCount; ++ currentBuffer)
+    {
+        const ENetBuffer * buffer = & host -> buffers [currentBuffer];
+
+        if (dataLength + buffer -> dataLength > sizeof (host -> sendBatchData [0]))
+          return -1;
+
+        memcpy (data + dataLength, buffer -> data, buffer -> dataLength);
+        dataLength += buffer -> dataLength;
+    }
+
+    message -> address = peer -> address;
+    message -> buffers = & host -> sendBatchBuffers [host -> sendBatchCount];
+    message -> bufferCount = 1;
+    message -> sentLength = 0;
+
+    host -> sendBatchBuffers [host -> sendBatchCount].data = data;
+    host -> sendBatchBuffers [host -> sendBatchCount].dataLength = dataLength;
+
+    ++ host -> sendBatchCount;
+
+    return 0;
+}
+#endif
+
 static ENetOutgoingCommand *
 enet_protocol_find_sent_reliable_command (ENetList * list, enet_uint16 reliableSequenceNumber, enet_uint8 channelID)
 {
@@ -1603,7 +1676,6 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
 {
     enet_uint8 headerData [sizeof (ENetProtocolHeader) + sizeof (enet_uint32)];
     ENetProtocolHeader * header = (ENetProtocolHeader *) headerData;
-    int sentLength = 0;
     size_t shouldCompress = 0;
     ENetList sentUnreliableCommands;
 
@@ -1635,7 +1707,12 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
             enet_protocol_check_timeouts (host, currentPeer, event) == 1)
         {
             if (event != NULL && event -> type != ENET_EVENT_TYPE_NONE)
+            {
+              if (enet_protocol_flush_send_batch (host) < 0)
+                return -1;
+
               return 1;
+            }
             else
               goto nextPeer;
         }
@@ -1726,21 +1803,36 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
 
         currentPeer -> lastSendTime = host -> serviceTime;
 
-        sentLength = enet_socket_send (host -> socket, & currentPeer -> address, host -> buffers, host -> bufferCount);
-
-        enet_protocol_remove_sent_unreliable_commands (currentPeer, & sentUnreliableCommands);
-
-        if (sentLength < 0)
+#if ENET_SOCKET_SUPPORTS_SEND_BATCH
+        if (enet_protocol_queue_send_batch (host, currentPeer) < 0)
           return -1;
 
-        host -> totalSentData += sentLength;
-        host -> totalSentPackets ++;
+        enet_protocol_remove_sent_unreliable_commands (currentPeer, & sentUnreliableCommands);
+#else
+        {
+            int sentLength = enet_socket_send (host -> socket,
+                                               & currentPeer -> address,
+                                               host -> buffers,
+                                               host -> bufferCount);
+
+            enet_protocol_remove_sent_unreliable_commands (currentPeer, & sentUnreliableCommands);
+
+            if (sentLength < 0)
+              return -1;
+
+            host -> totalSentData += sentLength;
+            host -> totalSentPackets ++;
+        }
+#endif
 
     nextPeer:
         if (currentPeer -> flags & ENET_PEER_FLAG_CONTINUE_SENDING)
           continueSending = sendPass + 1;
     }
-   
+
+    if (enet_protocol_flush_send_batch (host) < 0)
+      return -1;
+
     return 0;
 }
 
@@ -1918,4 +2010,3 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
 
     return 0; 
 }
-

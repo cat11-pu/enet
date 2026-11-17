@@ -357,6 +357,28 @@ enet_socket_send (ENetSocket socket,
 }
 
 int
+enet_socket_send_batch (ENetSocket socket,
+                        ENetSendMessage * messages,
+                        size_t messageCount)
+{
+    size_t currentMessage;
+
+    for (currentMessage = 0; currentMessage < messageCount; ++ currentMessage)
+    {
+        ENetSendMessage * message = & messages [currentMessage];
+
+        message -> sentLength = enet_socket_send (socket,
+                                                   & message -> address,
+                                                   message -> buffers,
+                                                   message -> bufferCount);
+        if (message -> sentLength < 0)
+          return -1;
+    }
+
+    return (int) messageCount;
+}
+
+int
 enet_socket_receive (ENetSocket socket,
                      ENetAddress * address,
                      ENetBuffer * buffers,
@@ -452,4 +474,3 @@ enet_socket_wait (ENetSocket socket, enet_uint32 * condition, enet_uint32 timeou
 } 
 
 #endif
-

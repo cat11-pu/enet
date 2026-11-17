@@ -18,6 +18,12 @@
 #include "enet/list.h"
 #include "enet/callbacks.h"
 
+#if defined(HAS_SENDMMSG)
+#define ENET_SOCKET_SUPPORTS_SEND_BATCH 1
+#else
+#define ENET_SOCKET_SUPPORTS_SEND_BATCH 0
+#endif
+
 #define ENET_VERSION_MAJOR 1
 #define ENET_VERSION_MINOR 3
 #define ENET_VERSION_PATCH 18
@@ -87,6 +93,16 @@ typedef struct _ENetAddress
    enet_uint32 host;
    enet_uint16 port;
 } ENetAddress;
+
+#define ENET_SOCKET_SEND_BATCH_MAXIMUM 64
+
+typedef struct _ENetSendMessage
+{
+   ENetAddress address;
+   const ENetBuffer * buffers;
+   size_t bufferCount;
+   int sentLength;
+} ENetSendMessage;
 
 /**
  * Packet flag bit constants.
@@ -378,6 +394,13 @@ typedef struct _ENetHost
    size_t               commandCount;
    ENetBuffer           buffers [ENET_BUFFER_MAXIMUM];
    size_t               bufferCount;
+   ENetSendMessage      sendBatch [ENET_SOCKET_SEND_BATCH_MAXIMUM];
+   ENetBuffer           sendBatchBuffers [ENET_SOCKET_SEND_BATCH_MAXIMUM];
+   enet_uint8           sendBatchData [ENET_SOCKET_SEND_BATCH_MAXIMUM]
+                                      [ENET_PROTOCOL_MAXIMUM_MTU +
+                                       sizeof (ENetProtocolHeader) +
+                                       sizeof (enet_uint32)];
+   size_t               sendBatchCount;
    ENetChecksumCallback checksum;                    /**< callback the user can set to enable packet checksums for this host */
    ENetCompressor       compressor;
    enet_uint8           packetData [2][ENET_PROTOCOL_MAXIMUM_MTU];
@@ -502,6 +525,7 @@ ENET_API int        enet_socket_listen (ENetSocket, int);
 ENET_API ENetSocket enet_socket_accept (ENetSocket, ENetAddress *);
 ENET_API int        enet_socket_connect (ENetSocket, const ENetAddress *);
 ENET_API int        enet_socket_send (ENetSocket, const ENetAddress *, const ENetBuffer *, size_t);
+ENET_API int        enet_socket_send_batch (ENetSocket, ENetSendMessage *, size_t);
 ENET_API int        enet_socket_receive (ENetSocket, ENetAddress *, ENetBuffer *, size_t);
 ENET_API int        enet_socket_wait (ENetSocket, enet_uint32 *, enet_uint32);
 ENET_API int        enet_socket_set_option (ENetSocket, ENetSocketOption, int);
@@ -612,4 +636,3 @@ extern size_t enet_protocol_command_size (enet_uint8);
 #endif
 
 #endif /* __ENET_ENET_H__ */
-

@@ -2,12 +2,15 @@ cmake_minimum_required(VERSION 2.8.12...3.20)
 
 project(enet)
 
+option(ENET_BUILD_BENCHMARKS "Build ENet benchmarks" OFF)
+
 # The "configure" step.
 include(CheckFunctionExists)
 include(CheckStructHasMember)
 include(CheckTypeSize)
 check_function_exists("fcntl" HAS_FCNTL)
 check_function_exists("poll" HAS_POLL)
+check_function_exists("sendmmsg" HAS_SENDMMSG)
 check_function_exists("getaddrinfo" HAS_GETADDRINFO)
 check_function_exists("getnameinfo" HAS_GETNAMEINFO)
 check_function_exists("gethostbyname_r" HAS_GETHOSTBYNAME_R)
@@ -36,6 +39,9 @@ if(HAS_FCNTL)
 endif()
 if(HAS_POLL)
     add_definitions(-DHAS_POLL=1)
+endif()
+if(HAS_SENDMMSG)
+    add_definitions(-DHAS_SENDMMSG=1)
 endif()
 if(HAS_GETNAMEINFO)
     add_definitions(-DHAS_GETNAMEINFO=1)
@@ -103,6 +109,13 @@ add_library(enet
     ${INCLUDE_FILES}
     ${SOURCE_FILES}
 )
+
+if(ENET_BUILD_BENCHMARKS AND UNIX AND NOT APPLE)
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_package(Threads REQUIRED)
+    add_executable(enet-send-batch-bench bench/send_batch_bench.c)
+    target_link_libraries(enet-send-batch-bench enet ${CMAKE_THREAD_LIBS_INIT})
+endif()
 
 if (WIN32)
     target_link_libraries(enet winmm ws2_32)
